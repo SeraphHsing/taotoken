@@ -2,10 +2,28 @@ import test, { beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { _internal, TaoTokenAuthPlugin } from "../index.mjs"
 
-const { windowsOf, toISO, readUsage, isNum } = _internal
+const { windowsOf, toISO, readUsage, isNum, tokenState, decodeJwtPayload, warnOnce } = _internal
+
+const DAY = 86_400_000
+const nowUnix = () => Math.floor(Date.now() / 1000)
+
+// a fake but well-formed JWT whose payload decodes correctly
+const mkJwt = (expUnix) => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o), "utf8").toString("base64url")
+  return `${b64({ alg: "none", typ: "JWT" })}.${b64({
+    sub: "m1",
+    username: "u",
+    channel: "phone",
+    userId: "x",
+    iat: nowUnix() - 3600,
+    exp: expUnix,
+    aud: ["taotoken"],
+  })}.c2ln`
+}
 
 beforeEach(() => {
   delete globalThis.fetch
+  _internal.notifiedToday.clear()
 })
 
 // mirror of the real /v1/plan/overview answer (user looked up on 2026-11-10)
@@ -224,4 +242,108 @@ test("provider.models: 登录后拉取 → 覆盖模型表；失败/未登录 �
   // 接口 500 → 回退原始 provider.models（未覆盖）
   globalThis.fetch = async () => new Response("boom", { status: 500 })
   assert.equal(await plugin.provider.models(provider, { auth: { type: "api", key: "sk-x" } }), baseModels)
+})
+
+// —— 令牌有效期与自动续期 ——
+
+test("decodeJwtPayload: 解析三段的 payload，非法输入返回 null", () => {
+  const exp = nowUnix() + 3600
+  const payload = decodeJwtPayload(mkJwt(exp))
+  assert.equal(payload.exp, exp)
+  assert.equal(payload.channel, "phone")
+  assert.equal(decodeJwtPayload("not-a-jwt"), null)
+  assert.equal(decodeJwtPayload(undefined), null)
+  assert.equal(decodeJwtPayload("a.b"), null)
+  assert.equal(decodeJwtPayload("eyJhbGc.!!!!!.sig"), null)
+})
+
+test("tokenState: 正常/过期/非法令牌的剩余天数", () => {
+  const in5 = Math.floor((Date.now() + 5 * DAY) / 1000)
+  assert.equal(tokenState(mkJwt(in5)).daysLeft, 5)
+  assert.ok(tokenState(mkJwt(in5)).expiresAt > Date.now())
+
+  const past = Math.floor((Date.now() - DAY) / 1000)
+  assert.ok(tokenState(mkJwt(past)).daysLeft <= 0)
+
+  assert.equal(tokenState("bad"), null)
+  assert.equal(tokenState("a.b.c"), null) // payload 无法解码
+})
+
+test("readUsage: 临期令牌 → plan 带「X 天后到期」预警，窗口仍完整", async () => {
+  fetchCalls = []
+  mockOk()
+  const exp = Math.floor((Date.now() + 5 * DAY) / 1000)
+  const out = await readUsage(getAuth(mkJwt(exp)))
+  assert.match(out.plan, /5 天后到期/)
+  assert.equal(out.windows.length, 3)
+  assert.equal(out.error, undefined)
+})
+
+test("readUsage: 已过期令牌 → plan 标记「已过期」", async () => {
+  fetchCalls = []
+  mockOk()
+  const exp = Math.floor((Date.now() - 3600) / 1000)
+  const out = await readUsage(getAuth(mkJwt(exp)))
+  assert.match(out.plan, /登录令牌已过期/)
+  assert.equal(out.windows.length, 3)
+})
+
+test("readUsage: 有效期大于 7 天 → plan 不带令牌预警", async () => {
+  fetchCalls = []
+  mockOk()
+  const exp = Math.floor((Date.now() + 15 * DAY) / 1000)
+  const out = await readUsage(getAuth(mkJwt(exp)))
+  assert.equal(out.plan, "Pro季卡")
+})
+
+test("warnOnce: 同一账号同一天只通知一次", () => {
+  const toasts = []
+  const logs = []
+  const client = { tui: { showToast: (m) => toasts.push(m) }, app: { log: (m) => logs.push(m) } }
+  const jwt = mkJwt(Math.floor(Date.now() / 1000) + 3600)
+  const st = tokenState(jwt)
+  warnOnce(client, jwt, st)
+  warnOnce(client, jwt, st)
+  warnOnce(client, mkJwt(Math.floor(Date.now() / 1000) + 7200), st) // 不同令牌同一天是新 key，应再通知
+  assert.equal(toasts.length, 2)
+  assert.equal(logs.length, 2)
+  assert.match(toasts[0], /天后过期/)
+  _internal.notifiedToday.clear()
+  warnOnce(client, jwt, st) // 清除后再次通知
+  assert.equal(toasts.length, 3)
+})
+
+test("usage: 成功读取时把 JWT 到期同步进账号 expires（client.auth.set），并临期通知", async () => {
+  const setCalls = []
+  const toasts = []
+  const client = {
+    tui: { showToast: (m) => toasts.push(m) },
+    app: { log: () => {} },
+    auth: { set: async (x) => setCalls.push(x) },
+  }
+  const plugin = await TaoTokenAuthPlugin({ client })
+  fetchCalls = []
+  mockOk()
+  const exp = Math.floor((Date.now() + 5 * DAY) / 1000)
+  await plugin.auth.usage(getAuth(mkJwt(exp)))
+  assert.equal(setCalls.length, 1)
+  assert.equal(setCalls[0].path.id, "taotoken")
+  assert.equal(setCalls[0].body.expires, exp * 1000) // 毫秒 exp 写入账号
+  assert.ok(setCalls[0].body.metadata?.loginToken) // 完整重写，保留 metadata
+  assert.equal(toasts.filter((t) => t.includes("5 天后过期")).length, 1)
+})
+
+test("usage: client.auth.set 抛错不影响用量返回", async () => {
+  const client = {
+    tui: { showToast: () => {} },
+    app: { log: () => {} },
+    auth: { set: async () => { throw new Error("auth 写失败") } },
+  }
+  const plugin = await TaoTokenAuthPlugin({ client })
+  fetchCalls = []
+  mockOk()
+  const jwt = mkJwt(Math.floor(Date.now() / 1000) + 15 * 86400)
+  const out = await plugin.auth.usage(getAuth(jwt))
+  assert.equal(out.plan, "Pro季卡")
+  assert.equal(out.windows.length, 3)
 })

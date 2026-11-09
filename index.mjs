@@ -9,14 +9,27 @@
 //                           in at taotoken.net (Browser DevTools → Application
 //                           → Cookies → token). Works as `Authorization` JWT.
 //
-// Usage is read along magpie's own refresh: magpie calls usage() whenever
-// its overview asks, and the plugin answers from taotoken each time.
+// The login token lasts 30 days (exp = iat + 30d) and taotoken has no refresh
+// token or sliding renewal. The plugin therefore:
+//   • parses the JWT and warns on the usage card when it is within 7 days;
+//   • writes its expiry into the account's `expires`, so magpie renews it
+//     through auth.refresh() 7 days early, pulling a fresh token from a local
+//     signed-in browser (scripts/capture-token.mjs, any Chromium-family
+//     browser with a debugging port); if no browser answers it returns
+//     undefined and the old token keeps being used;
+//   • notifies through magpie (toast + log) about pending expiry, renewals
+//     and renewal failures, at most once per account per day.
+
+import { createHash } from "node:crypto"
 
 const PROVIDER = "taotoken"
 const NAME = "TaoToken"
 const CODING_BASE = "https://api.taotoken.net/coding/v1" // OpenAI-compatible
 const WEB_API = "https://taotoken.net/api" // console API (usage)
 const SDK = "@ai-sdk/openai-compatible"
+const WARN_DAYS = 7 // warn and renew within this many days before expiry
+const DAY_MS = 86_400_000
+const REFRESH_LEAD_MS = WARN_DAYS * DAY_MS
 const ICON = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTUyIiBoZWlnaHQ9IjE0NSIgdmlld0JveD0iMCAwIDE1MiAxNDUiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxwYXRoIGQ9Ik04MyA3M0M4MyA3Ni44NjYgNzkuODY2IDgwIDc2IDgwQzcyLjEzNCA4MCA2OSA3Ni44NjYgNjkgNzNDNjkgNjkuMTM0IDcyLjEzNCA2NiA3NiA2NkM3OS44NjYgNjYgODMgNjkuMTM0IDgzIDczWiIgZmlsbD0iIzRGNDZFNSIvPgo8cGF0aCBkPSJNMCA4My42ODEzVjExN0wyMCA5N0g1OC41QzYwLjcwOTEgOTcgNjIuNSA5OC43OTA5IDYyLjUgMTAxVjEyOUwzOC4zMTM1IDE0NUg3NkgxMTMuNjg3TDg5LjUgMTI5VjEwMUM4OS41IDk4Ljc5MDkgOTEuMjkwOSA5NyA5My41IDk3SDEzMkwxNTIgMTE3VjgzLjY4MTNDMTUyIDc4LjgyNzcgMTQ3LjcxMyA3NS4wOTIzIDE0Mi45MDUgNzUuNzU2NUw3NiA4NUw5LjA5NDg2IDc1Ljc1NjVDNC4yODY5NyA3NS4wOTIzIDAgNzguODI3NyAwIDgzLjY4MTNaIiBmaWxsPSIjNEY0NkU1Ii8+CjxwYXRoIGQ9Ik03NiAwSDM4LjMxMzVMNjIuNSAxNlY0NEM2Mi41IDQ2LjIwOTEgNjAuNzA5MSA0OCA1OC41IDQ4SDIwTDAgMjhWNjEuMzE4N0MwIDY2LjE3MjMgNC4yODY5NyA2OS45MDc3IDkuMDk0ODYgNjkuMjQzNUw3NiA2MEwxNDIuOTA1IDY5LjI0MzVDMTQ3LjcxMyA2OS45MDc3IDE1MiA2Ni4xNzIzIDE1MiA2MS4zMTg3VjI4TDEzMiA0OEg5My41QzkxLjI5MDkgNDggODkuNSA0Ni4yMDkxIDg5LjUgNDRWMTZMMTEzLjY4NyAwSDc2WiIgZmlsbD0iIzRGNDZFNSIvPgo8L3N2Zz4K"
 
 // Models the Coding gateway is known to serve; login replaces the list.
@@ -44,6 +57,82 @@ const toISO = (s) => {
 }
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v)
+
+const b64url = (s) => {
+  const b64 = String(s).replace(/-/g, "+").replace(/_/g, "/")
+  const pad = b64.length % 4
+  return Buffer.from(pad === 2 ? b64 + "==" : pad === 3 ? b64 + "=" : b64, "base64").toString("utf8")
+}
+
+// decodeJwtPayload decodes the (unverified) claims of a JWT, or null.
+const decodeJwtPayload = (jwt) => {
+  if (typeof jwt !== "string") return null
+  const parts = jwt.split(".")
+  if (parts.length !== 3 || !parts[1]) return null
+  try {
+    const payload = JSON.parse(b64url(parts[1]))
+    return payload && typeof payload === "object" ? payload : null
+  } catch {
+    return null
+  }
+}
+
+// tokenState returns { expiresAt, daysLeft } for a JWT, or null.
+const tokenState = (jwt) => {
+  const payload = decodeJwtPayload(jwt)
+  const exp = payload?.exp
+  if (!isNum(exp)) return null
+  const at = exp * 1000
+  return { expiresAt: at, daysLeft: Math.ceil((at - Date.now()) / DAY_MS) }
+}
+
+// —— notifications through magpie ——
+const notifiedToday = new Set()
+
+const notify = (client, message) => {
+  try {
+    client?.tui?.showToast?.(message)
+  } catch {
+    /* silence */
+  }
+  try {
+    client?.app?.log?.(message)
+  } catch {
+    /* silence */
+  }
+}
+
+const dayKey = () => new Date().toISOString().slice(0, 10)
+
+// warnOnce notifies at most once per account per day about an expiring token.
+const warnOnce = (client, jwt, st) => {
+  const key = `${dayKey()}:${createHash("sha256").update(String(jwt)).digest("hex").slice(0, 16)}`
+  if (notifiedToday.has(key)) return
+  notifiedToday.add(key)
+  const when = new Date(st.expiresAt).toISOString().slice(0, 10)
+  const text =
+    st.daysLeft <= 0
+      ? `taotoken CodingPlan 用量令牌已过期（${when}）。请在浏览器重新登录 taotoken 后运行续期脚本，或在本插件重新登录填写新令牌。`
+      : `taotoken CodingPlan 用量令牌将于 ${st.daysLeft} 天后过期（${when}），到期前会自动续期，请保持本机浏览器登录 taotoken 并开启调试端口。`
+  notify(client, text)
+}
+
+// captureBrowserToken asks scripts/capture-token.mjs for the freshest login
+// token from any local signed-in browser (debugging port). Returns null when
+// none answers or anything goes wrong — never throws to the caller.
+const captureBrowserToken = async () => {
+  const { $ } = await import("bun").catch(() => ({ $: null }))
+  if (!$) return null
+  try {
+    const script = new URL("scripts/capture-token.mjs", import.meta.url).href
+    const out = await $`bun run ${script} --json`.quiet()
+    const parsed = JSON.parse(out.stdout)
+    return typeof parsed?.token === "string" && parsed.token ? parsed.token : null
+  } catch (e) {
+    console.warn(`[taotoken] capture-token failed: ${e?.message ?? e}`)
+    return null
+  }
+}
 
 // magpie's account row renders the first two windows only, so the short
 // 5-hour window must come first: 5 hour → week → month (unknown kinds last).
@@ -76,7 +165,7 @@ const errorOf = (status) =>
       ? `taotoken 用量服务暂时不可用（HTTP ${status}），请稍后再试。`
       : `taotoken 用量接口 HTTP ${status}。`
 
-// the read itself; usage() is a thin wrapper with error mapping
+// the read itself; usage() is a thin wrapper with error mapping and renewal sync
 async function readUsage(getAuth) {
   const auth = await getAuth()
   const jwt = auth?.metadata?.loginToken
@@ -111,8 +200,14 @@ async function readUsage(getAuth) {
   if (!Array.isArray(buckets) || !buckets.some((b) => isNum(b.used))) {
     return { error: "当前账号没有生效的 CodingPlan 用量", windows: [] }
   }
+  // warn about the login token's own expiry on the plan line (not an error)
+  const plan = subs?.showPlanTier ?? cp?.planLabel ?? "CodingPlan"
+  const st = tokenState(jwt)
+  const planLine = st && st.daysLeft <= WARN_DAYS
+    ? `${plan} · 登录令牌${st.daysLeft <= 0 ? "已过期" : ` ${st.daysLeft} 天后到期（${new Date(st.expiresAt).toISOString().slice(0, 10)}）`}`
+    : plan
   return {
-    plan: subs?.showPlanTier ?? cp?.planLabel ?? "CodingPlan",
+    plan: planLine,
     until: toISO(subs?.periodEnd),
     windows: windowsOf(buckets),
   }
@@ -120,7 +215,7 @@ async function readUsage(getAuth) {
 
 // —— the plugin ——
 
-export const TaoTokenAuthPlugin = async () => ({
+export const TaoTokenAuthPlugin = async ({ client }) => ({
   // the provider and its models before anyone signs in
   config: async (cfg) => {
     cfg.provider ??= {}
@@ -140,6 +235,8 @@ export const TaoTokenAuthPlugin = async () => ({
   auth: {
     provider: PROVIDER,
     icon: ICON,
+    // renew 7 days before the login token expires
+    refreshLead: REFRESH_LEAD_MS,
     methods: [
       {
         type: "api",
@@ -149,7 +246,8 @@ export const TaoTokenAuthPlugin = async () => ({
           {
             type: "password",
             key: "loginToken",
-            message: "CodingPlan 用量令牌（选填）— taotoken.net 登录后复制 Cookie 里 token 的值；不填则用量卡片不可用",
+            message:
+              "CodingPlan 用量令牌（选填）— taotoken.net 登录后复制 Cookie 里 token 的值；令牌约 30 天有效，到期前需保持本机浏览器登录态以自动续期；不填则用量卡片不可用",
           },
         ],
       },
@@ -165,9 +263,42 @@ export const TaoTokenAuthPlugin = async () => ({
     // the usage card: CodingPlan 5h / week / month, taotoken's fresh answer each ask
     async usage(getAuth) {
       try {
-        return await readUsage(getAuth)
+        const out = await readUsage(getAuth)
+        try {
+          const auth = await getAuth()
+          const jwt = auth?.metadata?.loginToken
+          const st = jwt && tokenState(jwt)
+          if (st) {
+            // let magpie renew us 7 days early: keep the account's expiry in sync
+            await client.auth.set({ path: { id: PROVIDER }, body: { ...auth, expires: st.expiresAt } })
+            if (st.daysLeft <= WARN_DAYS) warnOnce(client, jwt, st)
+          }
+        } catch {
+          /* sync/notify never breaks the usage card */
+        }
+        return out
       } catch (e) {
         return { error: e?.message ?? String(e), windows: [] }
+      }
+    },
+
+    // renewal: pull a fresh login token from a local signed-in browser
+    async refresh(auth) {
+      const jwt = await captureBrowserToken()
+      if (!jwt) {
+        notify(
+          client,
+          "taotoken CodingPlan 用量令牌自动续期未完成：本机浏览器未开启调试端口或未登录 taotoken。可运行 scripts/start-browser-debug.ps1（或手动续期脚本）后重试，用量会继续使用原令牌直到过期。",
+        )
+        return undefined // keep the old token; do not mark the account
+      }
+      const st = tokenState(jwt)
+      const when = st ? new Date(st.expiresAt).toISOString().slice(0, 10) : "未知日期"
+      notify(client, `taotoken CodingPlan 用量令牌已自动续期，新令牌有效期至 ${when}。`)
+      return {
+        ...(auth?.metadata ?? {}),
+        loginToken: jwt,
+        expires: st?.expiresAt,
       }
     },
   },
@@ -211,4 +342,19 @@ export const TaoTokenAuthPlugin = async () => ({
 })
 
 // for the unit tests
-export const _internal = { MODELS, WINDOWS, windowsOf, readUsage, toISO, isNum, errorOf }
+export const _internal = {
+  MODELS,
+  WINDOWS,
+  windowsOf,
+  readUsage,
+  toISO,
+  isNum,
+  errorOf,
+  WARN_DAYS,
+  REFRESH_LEAD_MS,
+  decodeJwtPayload,
+  tokenState,
+  notify,
+  warnOnce,
+  notifiedToday,
+}
