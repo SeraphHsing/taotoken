@@ -1,0 +1,11 @@
+# CodeBuddy 内部数据
+.codebuddy/
+
+# 敏感与临时文件
+.probe-cookies.tsv
+.node-secrets/
+.evals/
+*.tmp
+
+# node
+node_modules/

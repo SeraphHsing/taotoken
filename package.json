@@ -1,0 +1,35 @@
+{
+  "name": "@magpie-community/opencode-taotoken-auth",
+  "version": "0.1.0",
+  "description": "TaoToken CodingPlan provider plugin for magpie/OpenCode. Models via API key (https://api.taotoken.net/coding), CodingPlan usage card via login JWT.",
+  "type": "module",
+  "main": "./index.mjs",
+  "license": "MIT",
+  "keywords": [
+    "magpie",
+    "opencode",
+    "opencode-plugin",
+    "provider",
+    "auth",
+    "taotoken",
+    "coding-plan"
+  ],
+  "magpie": {
+    "maxConcurrency": 4,
+    "icon": "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTUyIiBoZWlnaHQ9IjE0NSIgdmlld0JveD0iMCAwIDE1MiAxNDUiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxwYXRoIGQ9Ik04MyA3M0M4MyA3Ni44NjYgNzkuODY2IDgwIDc2IDgwQzcyLjEzNCA4MCA2OSA3Ni44NjYgNjkgNzNDNjkgNjkuMTM0IDcyLjEzNCA2NiA3NiA2NkM3OS44NjYgNjYgODMgNjkuMTM0IDgzIDczWiIgZmlsbD0iIzRGNDZFNSIvPgo8cGF0aCBkPSJNMCA4My42ODEzVjExN0wyMCA5N0g1OC41QzYwLjcwOTEgOTcgNjIuNSA5OC43OTA5IDYyLjUgMTAxVjEyOUwzOC4zMTM1IDE0NUg3NkgxMTMuNjg3TDg5LjUgMTI5VjEwMUM4OS41IDk4Ljc5MDkgOTEuMjkwOSA5NyA5My41IDk3SDEzMkwxNTIgMTE3VjgzLjY4MTNDMTUyIDc4LjgyNzcgMTQ3LjcxMyA3NS4wOTIzIDE0Mi45MDUgNzUuNzU2NUw3NiA4NUw5LjA5NDg2IDc1Ljc1NjVDNC4yODY5NyA3NS4wOTIzIDAgNzguODI3NyAwIDgzLjY4MTNaIiBmaWxsPSIjNEY0NkU1Ii8+CjxwYXRoIGQ9Ik03NiAwSDM4LjMxMzVMNjIuNSAxNlY0NEM2Mi41IDQ2LjIwOTEgNjAuNzA5MSA0OCA1OC41IDQ4SDIwTDAgMjhWNjEuMzE4N0MwIDY2LjE3MjMgNC4yODY5NyA2OS45MDc3IDkuMDk0ODYgNjkuMjQzNUw3NiA2MEwxNDIuOTA1IDY5LjI0MzVDMTQ3LjcxMyA2OS45MDc3IDE1MiA2Ni4xNzIzIDE1MiA2MS4zMTg3VjI4TDEzMiA0OEg5My41QzkxLjI5MDkgNDggODkuNSA0Ni4yMDkxIDg5LjUgNDRWMTZMMTEzLjY4NyAwSDc2WiIgZmlsbD0iIzRGNDZFNSIvPgo8L3N2Zz4K"
+  },
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "files": [
+    "index.mjs",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
