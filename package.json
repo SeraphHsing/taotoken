@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-taotoken-auth",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "description": "TaoToken CodingPlan provider plugin for magpie/OpenCode. Models via API key (https://api.taotoken.net/coding), CodingPlan usage card via login JWT.",
   "type": "module",
   "main": "./index.mjs",
